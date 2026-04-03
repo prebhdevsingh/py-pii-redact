@@ -98,8 +98,8 @@ PII_CATEGORIES = {
 # --- Redaction Engine --------------------------------------------------------
 
 
-def find_pii(text, selected_categories, custom_regex=None):
-    """Find all PII matches in text. Returns list of (start, end, category)."""
+def find_pii(text, selected_categories, custom_regex=None, custom_texts=None):
+    """Find all PII matches in text. Returns list of (start, end, category, matched_text)."""
     matches = []
     for cat_key, cat_info in PII_CATEGORIES.items():
         if cat_key not in selected_categories:
@@ -113,24 +113,43 @@ def find_pii(text, selected_categories, custom_regex=None):
                 matches.append((m.start(), m.end(), "Custom", m.group()))
         except re.error:
             pass  # invalid regex silently skipped during detection
+    if custom_texts:
+        for term in custom_texts:
+            for m in re.finditer(re.escape(term), text, re.IGNORECASE):
+                matches.append((m.start(), m.end(), "CustomText", m.group()))
     return matches
 
 
-def redact_pdf(input_path, output_path, selected_categories, custom_regex=None):
+def redact_pdf(input_path, output_path, selected_categories,
+               custom_regex=None, custom_texts=None, password=None):
     """Redact PII from a PDF. Returns count of redactions made."""
     doc = fitz.open(input_path)
+
+    if doc.is_encrypted:
+        if not password or not doc.authenticate(password):
+            doc.close()
+            raise ValueError("Incorrect password or password required for this PDF.")
+
     total_redactions = 0
 
     for page in doc:
         text = page.get_text()
-        matches = find_pii(text, selected_categories, custom_regex)
+        matches = find_pii(text, selected_categories, custom_regex, custom_texts)
 
         for start, end, category, matched_text in matches:
-            # Search for the matched text on the page and redact each occurrence
             text_instances = page.search_for(matched_text)
             for inst in text_instances:
                 page.add_redact_annot(inst, fill=(0, 0, 0))
                 total_redactions += 1
+
+        # Also search the page directly for custom text terms (case-insensitive)
+        # This catches variants that the regex text-match may miss
+        if custom_texts:
+            for term in custom_texts:
+                text_instances = page.search_for(term)
+                for inst in text_instances:
+                    page.add_redact_annot(inst, fill=(0, 0, 0))
+                    total_redactions += 1
 
         page.apply_redactions()
 
@@ -147,12 +166,13 @@ class RedactorApp(ctk.CTk):
         super().__init__()
 
         self.title("PDF PII Redactor")
-        self.geometry("620x700")
-        self.minsize(580, 650)
+        self.geometry("620x800")
+        self.minsize(580, 750)
         ctk.set_appearance_mode("system")
         ctk.set_default_color_theme("blue")
 
         self.selected_file = None
+        self.pdf_password = None
         self.category_vars = {}
 
         self._build_ui()
@@ -214,6 +234,38 @@ class RedactorApp(ctk.CTk):
             command=lambda: self._toggle_all(False),
         ).pack(side="left")
 
+        cat_note = ctk.CTkLabel(
+            cat_frame,
+            text="Note: Pattern matching may not catch all PII. For thorough redaction,\nuse the custom text or custom regex fields below.",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+        )
+        cat_note.pack(anchor="w", padx=15, pady=(0, 12))
+
+        # --- Custom Text ---
+        text_frame = ctk.CTkFrame(self)
+        text_frame.pack(padx=20, pady=(0, 10), fill="x")
+
+        text_label = ctk.CTkLabel(
+            text_frame,
+            text="Custom text to redact (optional):",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        text_label.pack(anchor="w", padx=15, pady=(12, 4))
+
+        text_hint = ctk.CTkLabel(
+            text_frame,
+            text="Separate with commas or spaces — e.g. John Doe, 123 Main St, ACME Corp",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+        )
+        text_hint.pack(anchor="w", padx=15, pady=(0, 6))
+
+        self.custom_text_entry = ctk.CTkEntry(
+            text_frame, placeholder_text="e.g. John Doe, 123 Main St, ACME Corp"
+        )
+        self.custom_text_entry.pack(padx=15, pady=(0, 12), fill="x")
+
         # --- Custom Regex ---
         regex_frame = ctk.CTkFrame(self)
         regex_frame.pack(padx=20, pady=(0, 10), fill="x")
@@ -258,6 +310,35 @@ class RedactorApp(ctk.CTk):
             command=self._select_file,
         ).pack(side="left")
 
+        # Password row (hidden by default, shown when encrypted PDF is selected)
+        self.password_frame = ctk.CTkFrame(file_frame, fg_color="transparent")
+
+        self.password_label = ctk.CTkLabel(
+            self.password_frame,
+            text="Password:",
+            font=ctk.CTkFont(size=13),
+        )
+        self.password_label.pack(side="left", padx=(0, 8))
+
+        self.password_entry = ctk.CTkEntry(
+            self.password_frame, show="*", placeholder_text="Enter PDF password",
+            width=250,
+        )
+        self.password_entry.pack(side="left", padx=(0, 8))
+
+        self.password_verify_btn = ctk.CTkButton(
+            self.password_frame, text="Unlock", width=80,
+            command=self._verify_password,
+        )
+        self.password_verify_btn.pack(side="left")
+
+        self.password_status = ctk.CTkLabel(
+            self.password_frame,
+            text="",
+            font=ctk.CTkFont(size=12),
+        )
+        self.password_status.pack(side="left", padx=(8, 0))
+
         # --- Redact Button ---
         self.redact_btn = ctk.CTkButton(
             self,
@@ -301,14 +382,63 @@ class RedactorApp(ctk.CTk):
             title="Select a PDF",
             filetypes=[("PDF files", "*.pdf")],
         )
-        if path:
-            self.selected_file = path
-            name = Path(path).name
+        if not path:
+            return
+
+        self.pdf_password = None
+        self.password_entry.delete(0, "end")
+        self.password_status.configure(text="")
+
+        # Check if PDF is encrypted
+        try:
+            doc = fitz.open(path)
+            is_encrypted = doc.is_encrypted
+            doc.close()
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open PDF:\n{e}")
+            return
+
+        self.selected_file = path
+        name = Path(path).name
+
+        if is_encrypted:
+            self.file_label.configure(
+                text=f"Selected: {name} (encrypted — enter password below)",
+                text_color="orange",
+            )
+            self.password_frame.pack(padx=15, pady=(0, 12), fill="x")
+            self.redact_btn.configure(state="disabled")
+            self.password_entry.focus()
+        else:
             self.file_label.configure(
                 text=f"Selected: {name}", text_color=("black", "white")
             )
+            self.password_frame.pack_forget()
             self.redact_btn.configure(state="normal")
-            self.status_label.configure(text="")
+
+        self.status_label.configure(text="")
+
+    def _verify_password(self):
+        """Verify the entered password against the selected PDF."""
+        password = self.password_entry.get()
+        if not password:
+            self.password_status.configure(text="Enter a password", text_color="orange")
+            return
+
+        try:
+            doc = fitz.open(self.selected_file)
+            if doc.authenticate(password):
+                doc.close()
+                self.pdf_password = password
+                self.password_status.configure(text="Unlocked", text_color="green")
+                self.redact_btn.configure(state="normal")
+            else:
+                doc.close()
+                self.pdf_password = None
+                self.password_status.configure(text="Wrong password", text_color="red")
+                self.redact_btn.configure(state="disabled")
+        except Exception as e:
+            self.password_status.configure(text="Error", text_color="red")
 
     def _run_redaction(self):
         if not self.selected_file:
@@ -316,11 +446,20 @@ class RedactorApp(ctk.CTk):
 
         selected = [k for k, v in self.category_vars.items() if v.get()]
         custom_regex = self.regex_entry.get().strip() or None
+        custom_texts_raw = self.custom_text_entry.get().strip()
+        if custom_texts_raw:
+            # Split on commas first; if no commas, split on spaces
+            if "," in custom_texts_raw:
+                custom_texts = [t.strip() for t in custom_texts_raw.split(",") if t.strip()]
+            else:
+                custom_texts = [t.strip() for t in custom_texts_raw.split() if t.strip()]
+        else:
+            custom_texts = None
 
-        if not selected and not custom_regex:
+        if not selected and not custom_regex and not custom_texts:
             messagebox.showwarning(
                 "Nothing to redact",
-                "Please select at least one PII category or enter a custom regex.",
+                "Please select at least one PII category, enter a custom regex, or add custom text.",
             )
             return
 
@@ -346,7 +485,8 @@ class RedactorApp(ctk.CTk):
 
         try:
             count = redact_pdf(
-                str(input_path), str(output_path), selected, custom_regex
+                str(input_path), str(output_path), selected,
+                custom_regex, custom_texts, self.pdf_password,
             )
             self.status_label.configure(
                 text=f"Done! {count} redaction(s) applied.", text_color="green"
@@ -365,5 +505,10 @@ class RedactorApp(ctk.CTk):
 # --- Entry Point -------------------------------------------------------------
 
 if __name__ == "__main__":
+    print()
+    print("  PDF PII Redactor is running.")
+    print("  The app window may be behind other windows — check your taskbar or dock.")
+    print("  Close the app window or press Ctrl+C here to quit.")
+    print()
     app = RedactorApp()
     app.mainloop()
