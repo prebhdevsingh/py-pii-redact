@@ -38,15 +38,13 @@ You should see something like `Python 3.12.x`.
 
 > **Note:** On some Macs, you may need to use `python3` instead of `python` in the commands below.
 
-### 2. Install Dependencies
+That's it — one-time setup is done. The app will automatically install any missing Python packages on first run.
 
-Open a terminal / Command Prompt, navigate to this folder, and run:
-
-```
-pip install -r requirements.txt
-```
-
-That's it — one-time setup is done.
+> **Mac users with pyenv:** If you get a `No module named '_tkinter'` error, you need tcl-tk 8.x installed before building Python:
+> ```
+> brew install tcl-tk@8
+> PKG_CONFIG_PATH="/opt/homebrew/opt/tcl-tk@8/lib/pkgconfig" pyenv install <your-version> --force
+> ```
 
 ## Usage
 
