@@ -9,6 +9,7 @@ import re
 import os
 import sys
 import subprocess
+import threading
 import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -26,12 +27,17 @@ def _ensure_dependencies():
     except ImportError:
         missing.append("customtkinter")
     if missing:
-        print(f"Installing missing packages: {', '.join(missing)}...")
+        print(f"\n  The following packages are required: {', '.join(missing)}")
+        answer = input("  Install them now? [Y/n] ").strip().lower()
+        if answer not in ("", "y", "yes"):
+            print("  Cannot run without dependencies. Exiting.")
+            sys.exit(1)
+        print("  Installing...")
         subprocess.check_call(
             [sys.executable, "-m", "pip", "install"] + missing,
             stdout=subprocess.DEVNULL,
         )
-        print("Done. Starting app...")
+        print("  Done. Starting app...")
 
 _ensure_dependencies()
 
@@ -98,6 +104,32 @@ PII_CATEGORIES = {
 # --- Redaction Engine --------------------------------------------------------
 
 
+REGEX_TIMEOUT_SECONDS = 5
+
+
+def _regex_finditer_with_timeout(pattern, text, flags=0, timeout=REGEX_TIMEOUT_SECONDS):
+    """Run re.finditer in a thread with a timeout to prevent ReDoS."""
+    results = []
+    error = [None]
+
+    def _search():
+        try:
+            for m in re.finditer(pattern, text, flags):
+                results.append(m)
+        except re.error as e:
+            error[0] = e
+
+    thread = threading.Thread(target=_search, daemon=True)
+    thread.start()
+    thread.join(timeout)
+
+    if thread.is_alive():
+        raise TimeoutError(f"Regex pattern took longer than {timeout}s — it may be too complex.")
+    if error[0]:
+        raise error[0]
+    return results
+
+
 def find_pii(text, selected_categories, custom_regex=None, custom_texts=None):
     """Find all PII matches in text. Returns list of (start, end, category, matched_text)."""
     matches = []
@@ -109,10 +141,10 @@ def find_pii(text, selected_categories, custom_regex=None, custom_texts=None):
                 matches.append((m.start(), m.end(), cat_key, m.group()))
     if custom_regex and custom_regex.strip():
         try:
-            for m in re.finditer(custom_regex, text):
+            for m in _regex_finditer_with_timeout(custom_regex, text):
                 matches.append((m.start(), m.end(), "Custom", m.group()))
-        except re.error:
-            pass  # invalid regex silently skipped during detection
+        except (re.error, TimeoutError):
+            pass  # invalid or too-complex regex skipped during detection
     if custom_texts:
         for term in custom_texts:
             for m in re.finditer(re.escape(term), text, re.IGNORECASE):
@@ -463,15 +495,24 @@ class RedactorApp(ctk.CTk):
             )
             return
 
-        # Validate custom regex
+        # Validate custom regex (syntax + complexity)
         if custom_regex:
             try:
                 re.compile(custom_regex)
+                # Quick test against a small string to catch catastrophic backtracking
+                _regex_finditer_with_timeout(custom_regex, "test string", timeout=2)
             except re.error as e:
                 messagebox.showerror(
                     "Invalid Regex",
                     f"Your custom regex pattern is invalid:\n{e}\n\n"
                     "Tip: Use regex101.com to test your pattern first.",
+                )
+                return
+            except TimeoutError:
+                messagebox.showerror(
+                    "Regex Too Complex",
+                    "Your regex pattern is too complex and may hang the app.\n\n"
+                    "Tip: Simplify the pattern or use the custom text field instead.",
                 )
                 return
 
